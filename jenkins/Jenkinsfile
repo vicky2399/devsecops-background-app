@@ -1,0 +1,351 @@
+pipeline {
+    agent any
+    
+    environment {
+        MAVEN_HOME = tool 'Maven'
+        SONAR_SCANNER_HOME = tool 'SonarQubeScanner'
+        DOCKER_REGISTRY = 'your-nexus-registry.com'
+        DOCKER_REPO = 'devsecops/background-app'
+        IMAGE_TAG = "${BUILD_NUMBER}"
+        NEXUS_URL = 'http://your-nexus-server:8081'
+        NEXUS_REPOSITORY = 'maven-releases'
+        TRIVY_CACHE_DIR = '/tmp/trivy-cache'
+    }
+    
+    tools {
+        maven 'Maven'
+        jdk 'JDK11'
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: "git rev-parse --short HEAD",
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+        
+        stage('Maven Compile') {
+            steps {
+                script {
+                    sh '''
+                        echo "Starting Maven Compile..."
+                        mvn clean compile -DskipTests=true
+                        echo "Maven Compile completed successfully"
+                    '''
+                }
+            }
+            post {
+                success {
+                    echo 'Maven compilation successful'
+                }
+                failure {
+                    echo 'Maven compilation failed'
+                    emailext (
+                        subject: "Build Failed: Maven Compile - ${env.JOB_NAME} - ${env.BUILD_NUMBER}",
+                        body: "Maven compilation failed for build ${env.BUILD_NUMBER}. Please check the logs.",
+                        to: "${env.CHANGE_AUTHOR_EMAIL ?: 'devops-team@company.com'}"
+                    )
+                }
+            }
+        }
+        
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    script {
+                        sh '''
+                            echo "Starting SonarQube Analysis..."
+                            mvn sonar:sonar \
+                                -Dsonar.projectKey=background-color-app \
+                                -Dsonar.projectName="Background Color App" \
+                                -Dsonar.projectVersion=${BUILD_NUMBER} \
+                                -Dsonar.sources=. \
+                                -Dsonar.exclusions="**/target/**,**/node_modules/**" \
+                                -Dsonar.java.binaries=target/classes
+                            echo "SonarQube Analysis completed"
+                        '''
+                    }
+                }
+            }
+            post {
+                always {
+                    script {
+                        timeout(time: 5, unit: 'MINUTES') {
+                            def qg = waitForQualityGate()
+                            if (qg.status != 'OK') {
+                                error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Trivy Filesystem Scan') {
+            steps {
+                script {
+                    sh '''
+                        echo "Starting Trivy Filesystem Scan..."
+                        
+                        # Create cache directory
+                        mkdir -p ${TRIVY_CACHE_DIR}
+                        
+                        # Update Trivy database
+                        trivy --cache-dir ${TRIVY_CACHE_DIR} image --download-db-only
+                        
+                        # Scan filesystem for vulnerabilities
+                        trivy --cache-dir ${TRIVY_CACHE_DIR} fs --format table --output trivy-fs-report.txt .
+                        
+                        # Scan for secrets
+                        trivy --cache-dir ${TRIVY_CACHE_DIR} fs --scanners secret --format table --output trivy-secrets-report.txt .
+                        
+                        # Generate JSON report for further processing
+                        trivy --cache-dir ${TRIVY_CACHE_DIR} fs --format json --output trivy-fs-report.json .
+                        
+                        echo "Trivy Filesystem Scan completed"
+                        
+                        # Display summary
+                        echo "=== TRIVY FILESYSTEM SCAN SUMMARY ==="
+                        cat trivy-fs-report.txt
+                        echo "=== TRIVY SECRETS SCAN SUMMARY ==="
+                        cat trivy-secrets-report.txt
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-*-report.*', fingerprint: true
+                    publishHTML([
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: '.',
+                        reportFiles: 'trivy-fs-report.txt',
+                        reportName: 'Trivy Filesystem Scan Report'
+                    ])
+                }
+            }
+        }
+        
+        stage('Maven Package & Test') {
+            steps {
+                script {
+                    sh '''
+                        echo "Starting Maven Package and Test..."
+                        mvn clean package -DskipTests=false
+                        echo "Maven Package completed successfully"
+                    '''
+                }
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: 'target/surefire-reports/*.xml'
+                    archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+                }
+            }
+        }
+        
+        stage('Nexus Artifact Upload') {
+            steps {
+                script {
+                    sh '''
+                        echo "Starting Nexus Artifact Upload..."
+                        
+                        # Upload JAR artifact to Nexus
+                        mvn deploy:deploy-file \
+                            -DgroupId=com.devsecops \
+                            -DartifactId=background-color-app \
+                            -Dversion=${BUILD_NUMBER} \
+                            -Dpackaging=jar \
+                            -Dfile=target/background-color-app-1.0.0.jar \
+                            -DrepositoryId=nexus \
+                            -Durl=${NEXUS_URL}/repository/${NEXUS_REPOSITORY}
+                        
+                        echo "Nexus Artifact Upload completed successfully"
+                    '''
+                }
+            }
+            post {
+                success {
+                    echo "Artifact successfully uploaded to Nexus"
+                }
+                failure {
+                    emailext (
+                        subject: "Build Failed: Nexus Upload - ${env.JOB_NAME} - ${env.BUILD_NUMBER}",
+                        body: "Nexus artifact upload failed for build ${env.BUILD_NUMBER}. Please check the logs.",
+                        to: "${env.CHANGE_AUTHOR_EMAIL ?: 'devops-team@company.com'}"
+                    )
+                }
+            }
+        }
+        
+        stage('Docker Build & Tag') {
+            steps {
+                script {
+                    sh '''
+                        echo "Starting Docker Build and Tag..."
+                        
+                        # Build Docker image
+                        docker build -t ${DOCKER_REPO}:${IMAGE_TAG} .
+                        docker build -t ${DOCKER_REPO}:latest .
+                        
+                        # Tag for registry
+                        docker tag ${DOCKER_REPO}:${IMAGE_TAG} ${DOCKER_REGISTRY}/${DOCKER_REPO}:${IMAGE_TAG}
+                        docker tag ${DOCKER_REPO}:latest ${DOCKER_REGISTRY}/${DOCKER_REPO}:latest
+                        
+                        echo "Docker Build and Tag completed successfully"
+                        
+                        # Display image info
+                        docker images | grep ${DOCKER_REPO}
+                    '''
+                }
+            }
+            post {
+                success {
+                    echo "Docker image built and tagged successfully"
+                }
+                failure {
+                    emailext (
+                        subject: "Build Failed: Docker Build - ${env.JOB_NAME} - ${env.BUILD_NUMBER}",
+                        body: "Docker build failed for build ${env.BUILD_NUMBER}. Please check the logs.",
+                        to: "${env.CHANGE_AUTHOR_EMAIL ?: 'devops-team@company.com'}"
+                    )
+                }
+            }
+        }
+        
+        stage('Trivy Image Scan') {
+            steps {
+                script {
+                    sh '''
+                        echo "Starting Trivy Image Scan..."
+                        
+                        # Scan Docker image for vulnerabilities
+                        trivy --cache-dir ${TRIVY_CACHE_DIR} image --format table --output trivy-image-report.txt ${DOCKER_REPO}:${IMAGE_TAG}
+                        
+                        # Generate JSON report
+                        trivy --cache-dir ${TRIVY_CACHE_DIR} image --format json --output trivy-image-report.json ${DOCKER_REPO}:${IMAGE_TAG}
+                        
+                        # Scan for high and critical vulnerabilities only
+                        trivy --cache-dir ${TRIVY_CACHE_DIR} image --severity HIGH,CRITICAL --format table --output trivy-image-critical.txt ${DOCKER_REPO}:${IMAGE_TAG}
+                        
+                        echo "Trivy Image Scan completed"
+                        
+                        # Display critical vulnerabilities
+                        echo "=== CRITICAL AND HIGH VULNERABILITIES ==="
+                        cat trivy-image-critical.txt
+                        
+                        # Check if critical vulnerabilities exist and fail if found
+                        CRITICAL_COUNT=$(trivy --cache-dir ${TRIVY_CACHE_DIR} image --severity CRITICAL --format json ${DOCKER_REPO}:${IMAGE_TAG} | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length')
+                        
+                        if [ "$CRITICAL_COUNT" -gt 0 ]; then
+                            echo "CRITICAL vulnerabilities found: $CRITICAL_COUNT"
+                            echo "Pipeline will continue but requires immediate attention"
+                        fi
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-image-*.*', fingerprint: true
+                    publishHTML([
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: '.',
+                        reportFiles: 'trivy-image-report.txt',
+                        reportName: 'Trivy Image Scan Report'
+                    ])
+                }
+            }
+        }
+        
+        stage('Docker Push') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: 'nexus-docker-registry', usernameVariable: 'REGISTRY_USER', passwordVariable: 'REGISTRY_PASS')]) {
+                        sh '''
+                            echo "Starting Docker Push..."
+                            
+                            # Login to Docker registry
+                            echo $REGISTRY_PASS | docker login ${DOCKER_REGISTRY} -u $REGISTRY_USER --password-stdin
+                            
+                            # Push images
+                            docker push ${DOCKER_REGISTRY}/${DOCKER_REPO}:${IMAGE_TAG}
+                            docker push ${DOCKER_REGISTRY}/${DOCKER_REPO}:latest
+                            
+                            echo "Docker Push completed successfully"
+                            
+                            # Logout for security
+                            docker logout ${DOCKER_REGISTRY}
+                        '''
+                    }
+                }
+            }
+            post {
+                success {
+                    echo "Docker images pushed successfully to registry"
+                }
+                failure {
+                    emailext (
+                        subject: "Build Failed: Docker Push - ${env.JOB_NAME} - ${env.BUILD_NUMBER}",
+                        body: "Docker push failed for build ${env.BUILD_NUMBER}. Please check the logs.",
+                        to: "${env.CHANGE_AUTHOR_EMAIL ?: 'devops-team@company.com'}"
+                    )
+                }
+                always {
+                    // Clean up local images to save space
+                    sh '''
+                        docker rmi ${DOCKER_REPO}:${IMAGE_TAG} || true
+                        docker rmi ${DOCKER_REPO}:latest || true
+                        docker rmi ${DOCKER_REGISTRY}/${DOCKER_REPO}:${IMAGE_TAG} || true
+                        docker rmi ${DOCKER_REGISTRY}/${DOCKER_REPO}:latest || true
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Clean workspace
+            cleanWs()
+            
+            // Send build notification
+            script {
+                def buildStatus = currentBuild.result ?: 'SUCCESS'
+                def colorCode = buildStatus == 'SUCCESS' ? 'good' : 'danger'
+                def subject = "${buildStatus}: ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
+                def summary = """
+                Build Status: ${buildStatus}
+                Job: ${env.JOB_NAME}
+                Build Number: ${env.BUILD_NUMBER}
+                Git Commit: ${env.GIT_COMMIT_SHORT}
+                Duration: ${currentBuild.durationString}
+                """
+                
+                emailext (
+                    subject: subject,
+                    body: summary,
+                    to: "${env.CHANGE_AUTHOR_EMAIL ?: 'devops-team@company.com'}",
+                    attachLog: buildStatus != 'SUCCESS'
+                )
+            }
+        }
+        success {
+            echo 'Pipeline completed successfully!'
+        }
+        failure {
+            echo 'Pipeline failed. Please check the logs.'
+        }
+        unstable {
+            echo 'Pipeline completed with warnings.'
+        }
+    }
+}
